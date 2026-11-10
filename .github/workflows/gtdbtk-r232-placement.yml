@@ -1,0 +1,257 @@
+name: gtdbtk-r232-placement
+
+# Builds the release gtdbtk-r232-placement-v1:
+#   build   streams GTDB's 60.8 GB GTDB-Tk R232 package (MD5 checked), keeps the folders that
+#           placement and classification need (no skani/, no msa/), hashes them the way
+#           GTDB-Tk does, packs them into .tar.zst units under 2 GiB, and uploads them to a
+#           draft release;
+#   verify  on a fresh runner, downloads every asset, checks SHA256SUMS and MD5SUMS, unpacks,
+#           recomputes the folder hashes and classifies GTDB's test genome with GTDB-Tk 2.8.0
+#           (gPlace in place of pplacer, ANI screen skipped);
+#   publish turns the draft into a published release, only if verify passed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TAG: gtdbtk-r232-placement-v1
+  URL: https://data.gtdb.ecogenomic.org/releases/release232/232.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r232_data.tar.gz
+  EXPECTED_MD5: 25a59e0352b1fd150c589f56559767d4
+  EXPECTED_BYTES: "60806405195"
+  MOCKUP: https://data.gtdb.ecogenomic.org/releases/release232/232.0/auxillary_files/gtdbtk_package/mockup_db
+  GPLACE_SHA: 695a401e0b54cc1bde55a5e1498a0697899b15ea # cmc-aau/gPlace, __version__ 0.1.1
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: Tools and data disk
+        run: |
+          sudo apt-get install -y pigz zstd >/dev/null
+          root_free=$(df --output=avail -B1 / | tail -1)
+          mnt_free=$(df --output=avail -B1 /mnt 2>/dev/null | tail -1 || echo 0)
+          if [[ ${mnt_free:-0} -gt $root_free ]]; then base=/mnt; else base=$HOME; fi
+          sudo mkdir -p "$base/w" && sudo chown "$USER" "$base/w"
+          echo "W=$base/w" >> "$GITHUB_ENV"
+          df -h / /mnt || true
+
+      - name: Stream archive, check MD5, extract all but skani/ and msa/
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/data" "$W/meta"
+          start=$(date +%s)
+          curl -fsS -w '%{stderr}%{size_download}\n' "$URL" 2> "$W/meta/curl.txt" \
+            | tee >(md5sum | cut -d' ' -f1 > "$W/meta/md5.txt") \
+            | pigz -dc \
+            | tar -x -C "$W/data" --exclude='release232/skani' --exclude='release232/msa'
+          for _ in $(seq 60); do [[ -s $W/meta/md5.txt ]] && break; sleep 1; done
+          md5=$(cat "$W/meta/md5.txt"); bytes=$(tail -1 "$W/meta/curl.txt")
+          echo "stream_s=$(( $(date +%s) - start )) bytes=$bytes md5=$md5"
+          [[ $md5 == "$EXPECTED_MD5" ]] || { echo "::error::MD5 $md5 != $EXPECTED_MD5"; exit 1; }
+          [[ $bytes == "$EXPECTED_BYTES" ]] || { echo "::error::size $bytes != $EXPECTED_BYTES"; exit 1; }
+          ls "$W/data" "$W/data/release232"
+          [[ ! -e $W/data/release232/skani && ! -e $W/data/release232/msa ]]
+          du -sb "$W/data/release232"/* | sort -n
+
+      - name: What reads fasttree.log (refpkg CONTENTS.json, log head)
+        run: |
+          set -euo pipefail
+          rp=$W/data/release232/split/class_level/pplacer/gtdbtk.package.1.refpkg
+          {
+            echo '### Refpkg CONTENTS.json (class-level package 1)'
+            echo '```json'; cat "$rp/CONTENTS.json"; echo '```'
+            echo '### First 30 lines of its fasttree.log'
+            echo '```'; head -30 "$rp"/*fasttree.log | cut -c1-200; echo '```'
+            echo '### Last 10 lines'
+            echo '```'; tail -10 "$rp"/*fasttree.log | cut -c1-200; echo '```'
+          } | tee "$W/meta/refpkg.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: GTDB-Tk folder hashes
+        run: python3 -I scripts/gtdb_hashes.py compute "$W/data/release232" "$W/meta/FOLDER_HASHES.tsv"
+
+      - name: Pack .tar.zst units
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          python3 -I scripts/package.py "$W/data" "$W/out"
+          echo "pack_s=$(( $(date +%s) - start ))"
+          cp "$W/meta/FOLDER_HASHES.tsv" "$W/out/"
+          ls -l "$W/out"
+          {
+            echo '### Archives'; echo '```'; cut -f1,2,5,6 "$W/out/ARCHIVES.tsv"; echo '```'
+            echo '### fasttree.log files'; echo '```'; cat "$W/out/FASTTREE_LOGS.tsv"; echo '```'
+            echo '### Folder hashes'; echo '```'; cat "$W/out/FOLDER_HASHES.tsv"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to a draft release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null | grep -qx false; then
+            echo "::error::$TAG is already published"; exit 1
+          fi
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" \
+            --title "GTDB-Tk R232 placement data (unofficial mirror), v1" \
+            --notes-file gtdbtk-r232-placement/RELEASE_NOTES.md
+          cd "$W/out"
+          gh release upload "$TAG" --clobber *.tar.zst SHA256SUMS MD5SUMS MANIFEST.tsv \
+            ARCHIVES.tsv FOLDER_HASHES.tsv FASTTREE_LOGS.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-meta
+          path: |
+            ${{ env.W }}/meta/
+            ${{ env.W }}/out/*.tsv
+            ${{ env.W }}/out/*SUMS
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Data disk
+        run: |
+          sudo apt-get install -y zstd >/dev/null
+          root_free=$(df --output=avail -B1 / | tail -1)
+          mnt_free=$(df --output=avail -B1 /mnt 2>/dev/null | tail -1 || echo 0)
+          if [[ ${mnt_free:-0} -gt $root_free ]]; then base=/mnt; else base=$HOME; fi
+          sudo mkdir -p "$base/w" && sudo chown "$USER" "$base/w"
+          echo "W=$base/w" >> "$GITHUB_ENV"
+          df -h / /mnt || true
+
+      - name: Download every asset of the draft release
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/dl"
+          gh release download "$TAG" -D "$W/dl"
+          ls -l "$W/dl"
+
+      - name: Check SHA256SUMS and MD5SUMS
+        run: |
+          set -euo pipefail
+          cd "$W/dl"
+          sha256sum -c SHA256SUMS
+          md5sum -c MD5SUMS
+          diff <(ls *.tar.zst | sort) <(awk '{print $2}' SHA256SUMS | sort)
+
+      - name: Unpack and compare with MANIFEST.tsv
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/data"
+          for f in "$W"/dl/*.tar.zst; do zstd -dc "$f" | tar -x -C "$W/data"; done
+          cd "$W/data"
+          diff <(find release232 -type f | sort) <(tail -n +2 "$W/dl/MANIFEST.tsv" | cut -f2 | sort)
+          tail -n +2 "$W/dl/MANIFEST.tsv" | awk -F'\t' '{print $4"  "$2}' | sha256sum -c --quiet
+          echo "GTDBTK_DATA_PATH=$W/data/release232" >> "$GITHUB_ENV"
+          du -sh "$W/data/release232"
+
+      - name: Recompute GTDB-Tk folder hashes
+        run: python3 -I scripts/gtdb_hashes.py compare "$W/data/release232" "$W/dl/FOLDER_HASHES.tsv"
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: gtdb
+          create-args: >-
+            -c conda-forge -c bioconda
+            python=3.12 gtdbtk=2.8.0 pip
+          cache-environment: false
+
+      - name: Install gPlace 0.1.1 from source and the pplacer shim
+        run: |
+          set -euo pipefail
+          python -m pip install "git+https://github.com/cmc-aau/gPlace@${GPLACE_SHA}"
+          gplace check_install
+          mkdir -p "$HOME/shim"
+          cp scripts/pplacer-gplace-shim.sh "$HOME/shim/pplacer"; chmod +x "$HOME/shim/pplacer"
+          echo "REAL_PPLACER=$(command -v pplacer)" >> "$GITHUB_ENV"
+
+      - name: Classify GTDB's test genome from the mirror alone
+        run: |
+          set -euo pipefail
+          mkdir -p genomes
+          curl -fsSL "$MOCKUP/test_genome_G021783475.fna.gz" | gunzip > genomes/G021783475.fna
+          gtdbtk identify --genome_dir genomes -x fna --out_dir run/identify --cpus 4
+          gtdbtk align --identify_dir run/identify --out_dir run/align --skip_gtdb_refs --cpus 4
+          export PATH="$HOME/shim:$PATH" GPLACE_MAX_MEMORY=8.5G GPLACE_CALL_LOG=$PWD/gplace_calls.txt
+          python scripts/classify_no_ani.py classify --genome_dir genomes -x fna \
+            --align_dir run/align --out_dir run/classify --cpus 4 --pplacer_cpus 4
+          summary=$(find run/classify -name 'gtdbtk.bac120.summary.tsv' | head -1)
+          cut -f1,2,3 "$summary" | tee classification.tsv
+          grep -q 'g__Thermodesulfobium' "$summary"
+          echo "gPlace calls:"; cat gplace_calls.txt
+          [[ $(wc -l < gplace_calls.txt) -ge 2 ]]
+          {
+            echo "### Verification: G021783475 classified from the mirror (GTDB-Tk 2.8.0 + gPlace, no ANI screen)"
+            echo '```'; cat classification.tsv; echo; cat gplace_calls.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-results
+          path: |
+            classification.tsv
+            gplace_calls.txt
+            run/**/*.tsv
+            run/**/*.log
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          mkdir -p dl
+          gh release download "$TAG" -D dl -p ARCHIVES.tsv -p FOLDER_HASHES.tsv
+          {
+            cat gtdbtk-r232-placement/RELEASE_NOTES.md
+            echo
+            echo "## Assets"
+            echo
+            echo "| Archive | Size (bytes) | Files | Unpacked (bytes) | Contents |"
+            echo "|---|---:|---:|---:|---|"
+            tail -n +2 dl/ARCHIVES.tsv | awk -F'\t' '{printf "| `%s` | %d | %d | %d | `%s` |\n",$1,$2,$5,$6,$7}'
+            tail -n +2 dl/ARCHIVES.tsv | awk -F'\t' '{a+=$2;u+=$6} END {printf "| **Total** | **%d** | | **%d** | |\n",a,u}'
+            echo
+            echo "## GTDB-Tk folder hashes (sha1_dir, GTDB-Tk 2.8.0)"
+            echo
+            echo "| Folder | sha1_dir | GTDB-Tk 2.8.0 reference | Status |"
+            echo "|---|---|---|---|"
+            tail -n +2 dl/FOLDER_HASHES.tsv | awk -F'\t' '{printf "| `%s` | `%s` | `%s` | %s |\n",$1,$2,$3,$4}'
+            echo
+            echo "## Verification"
+            echo
+            echo "Built and verified in [this run]($run_url): a fresh runner downloaded every asset,"
+            echo "checked SHA256SUMS, MD5SUMS and every file in MANIFEST.tsv, recomputed the folder"
+            echo "hashes, and classified GTDB's test genome G021783475 with GTDB-Tk 2.8.0 and gPlace"
+            echo "0.1.1 from these files alone (\`g__Thermodesulfobium\`, ANI screen skipped)."
+          } > notes.md
+          gh release edit "$TAG" --draft=false --notes-file notes.md
+          gh release view "$TAG"
