@@ -18,8 +18,8 @@ file here differs from the publisher's, the publisher's copy is right: please
 
 GTDB publishes the GTDB-Tk reference data for release 232 as a single 60.8 GB gzip archive that
 unpacks to 100.5 GB. Most of that is the skani ANI database (85.2 GB). Placing genomes in the GTDB
-trees uses about 7.4 GB of it. This release holds that 7.4 GB, unmodified, split into archives you
-can download one by one.
+trees uses about 7.4 GB of it. This release holds that 7.4 GB (7,368,346,876 bytes, 256 files),
+unmodified, in 13 zstd archives that come to 280 MB in total (279,636,147 bytes).
 
 - **Source:** [`gtdbtk_r232_data.tar.gz`](https://data.gtdb.ecogenomic.org/releases/release232/232.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r232_data.tar.gz)
   from [GTDB's downloads](https://data.gtdb.ecogenomic.org/releases/release232/232.0/auxillary_files/gtdbtk_package/full_package/),
@@ -46,11 +46,14 @@ can download one by one.
 
 Sizes and hashes: the release notes, `ARCHIVES.tsv` and `SHA256SUMS`.
 
-Every reference package (`*.refpkg`) carries its own `gtdb_r232_bac120_fasttree.log` or
-`..._ar53_fasttree.log` (about 518 MB each). It is the FastTree log that the refpkg's
-`CONTENTS.json` lists as `tree_stats`; pplacer (and gPlace) read the substitution-model
-parameters from it, so it is required. `FASTTREE_LOGS.tsv` lists their hashes. Each archive keeps
-its own copy, so any archive works on its own.
+The ten bacterial reference packages (backbone, 8 class-level, full tree) each carry
+`gtdb_r232_bac120_fasttree.log`, 517,985,300 bytes. All ten are byte-identical (SHA-256
+`ff05065f…c928c64`, see `FASTTREE_LOGS.tsv`). Each refpkg's `CONTENTS.json` lists it as
+`tree_stats`, the FastTree log (`-wag`, CAT with 20 rate categories) from which pplacer and gPlace
+read the model parameters, so it is required; the ar53 package uses its own `fitting_stats.log`.
+The log is highly repetitive and compresses to a few MB, so every archive keeps its own copy and
+works on its own. On disk you can hard-link the copies (for example with `rdfind -makehardlinks
+true release232` or `jdupes -L`) to save 4.7 GB.
 
 ### What is excluded, and why
 
@@ -64,7 +67,7 @@ Getting either folder still means streaming GTDB's full archive, for example
 
 ### How to use it
 
-Download everything (about the size in the release notes), check it, and unpack it into one
+Download everything (280 MB), check it, and unpack it into one
 directory:
 
 ```sh
